@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { CheerioPage } from '../util/CheerioPage';
 import { ConfigService } from '@nestjs/config';
 import { Queue } from 'bull';
@@ -8,6 +8,11 @@ import { Browser, launch, Page } from 'puppeteer';
 import { Guard } from '../Types';
 import * as _ from 'lodash';
 import { RedisService } from 'nestjs-redis';
+import { IdemRedisService } from './idemPotency.service';
+import { CronExpression, SchedulerRegistry } from '@nestjs/schedule';
+import { ClientKafka } from '@nestjs/microservices';
+
+import { CronJob } from 'cron';
 @Injectable()
 export class PuppeteerService {
   private readonly logger = new Logger(PuppeteerService.name);
@@ -44,13 +49,16 @@ export class PuppeteerService {
   constructor(
     private readonly configService: ConfigService,
     private readonly redisService: RedisService,
+    private readonly idemRedisService: IdemRedisService,
     @InjectQueue('LGA_CRAWLER_QUEUE')
     private readonly lgaQueue: Queue,
-
+    private schedulerRegistry: SchedulerRegistry,
     @InjectQueue('PDF_QUEUE')
     private readonly pdfLinkQueue: Queue,
     @InjectQueue('WARD_QUEUE')
     private readonly wardLinkQueue: Queue,
+    @Inject('PDF_INEC_MICROSERVICE')
+    private readonly pdfKafkaClient: ClientKafka,
   ) {
     this.BASE_URL = this.configService.get<string>('BASE_URL');
     this.EMAIL = this.configService.get<string>('EMAIL');
@@ -79,25 +87,21 @@ export class PuppeteerService {
     }
   }
 
-  async refreshDoneWardLinks(): Promise<void> {
+  async onApplicationBootstrap() {
+    this.logger.log('PuppeteerService.onApplicationBootstrap');
     const redisKey = 'puppeteer:path:wardLinks:total';
     const redisValue = await this.redis.get(redisKey);
-    const wardLinks = JSON.parse(redisValue);
-    const completedWards = wardLinks?.filter((ward) => ward.done);
-    if (!_.isEmpty(wardLinks) && !_.isEmpty(completedWards)) {
-      this.logger.log(
-        'PuppeteerService.refreshDoneWardLinks refreshing completed wards for new updload check',
-      );
-      const updateWardLinks = wardLinks.map((ward) => ({
-        ...ward,
-        done: false,
-      }));
-      await this.redis.set(redisKey, JSON.stringify(updateWardLinks));
-      await this.distributeLoadForPdfGenerator(completedWards);
-    } else {
-      this.logger.log(
-        'PuppeteerService.refreshDoneWardLinks, no wards queu has been completed',
-      );
+    if (!_.isEmpty(redisValue)) {
+      const wardLinks = JSON.parse(redisValue) as Record<string, string>[];
+      const hrefs = wardLinks
+        .filter((e) => e['puCount'] == e['index'])
+        .map((link) => `puppeteer:path:wardLink:${link['href']}`);
+      const uniqHrefs = _.uniq(hrefs);
+      for (const link of uniqHrefs) {
+        if (!this.schedulerRegistry.doesExist('cron', link)) {
+          this.addCronJob(link, this.getPdfLink);
+        }
+      }
     }
   }
 
@@ -110,7 +114,7 @@ export class PuppeteerService {
     const browser = await this.browserPromise;
     const page = await browser.newPage();
     await page.setViewport({ width: 1200, height: 720 });
-    await this.login(page);
+    await this.lockLogin(page);
     const homePageLink = await this.getHomePageLink(page, Guard.Root);
     const governorElectionLinks = (await this.crawlUrl(
       page,
@@ -134,7 +138,7 @@ export class PuppeteerService {
   }
 
   async bulkAddOfLgaToQueue(links: Record<string, string>[]): Promise<void> {
-    for (const link of _.take(links, 1)) {
+    for (const link of links) {
       await this.lgaQueue.add(
         'wardCrawler',
         {
@@ -153,9 +157,7 @@ export class PuppeteerService {
     const page = await browser.newPage();
     try {
       await page.setViewport({ width: 1200, height: 720 });
-
-      await this.login(page);
-
+      await this.lockLogin(page);
       const wardLinks = (await this.crawlUrl(
         page,
         link['href'],
@@ -282,27 +284,12 @@ export class PuppeteerService {
     }
   }
 
-  async distributeLoadForPdfGenerator(links: Record<string, string>[]) {
-    for (const link of links) {
-      await this.pdfLinkQueue.add(
-        'CrawlPdf',
-        {
-          link,
-        },
-        {
-          removeOnFail: true,
-          attempts: 2,
-        },
-      );
-    }
-  }
-
   public async processWardLink(link: Record<string, string>) {
     const browser = await this.browserPromise;
     const page = await browser.newPage();
     try {
       await page.setViewport({ width: 1200, height: 720 });
-      await this.login(page);
+      await this.lockLogin(page);
       // Go to the target website
       const fullUrl = this.BASE_URL + link['href'];
 
@@ -311,17 +298,13 @@ export class PuppeteerService {
 
       const items = await page.$$('.btn-success');
       const totalButtons = items.length;
-      this.logger
-        .log(`The number of polling unit is ${totalButtons} and the items are
-       ${JSON.stringify(
-         items,
-       )} pulling unit full url is ${fullUrl} and the ward name is ${
-        link['text']
-      } the page url is ${await page.url()}`);
 
       // if items.length is 0 and the page url is correct then the something was wrong,
       // so we need to add the link to the queue again
       if (totalButtons === 0 && fullUrl.includes('/context/pus/lga')) {
+        // lock this place
+        await this.lockLogin(page, true);
+        // then release the lock
         await this.wardLinkQueue.add(
           'wardLinkProcessor',
           {
@@ -329,7 +312,6 @@ export class PuppeteerService {
           },
           {
             removeOnComplete: true,
-            removeOnFail: true,
             attempts: 2,
           },
         );
@@ -365,16 +347,15 @@ export class PuppeteerService {
             },
             {
               removeOnComplete: true,
-              removeOnFail: true,
               attempts: 2,
             },
           );
         }
       }
     } catch (e) {
-      this.logger.error('PuppeteerService processWardLink error', e);
+      this.logger.error(`PuppeteerService processWardLink error ${e}`);
     } finally {
-      // await page.close();
+      await page.close();
       this.logger.log('PuppeteerService processWardLink done');
     }
   }
@@ -404,14 +385,16 @@ export class PuppeteerService {
       // if items.length is 0 and the page url is correct then the something was wrong,
       // so we need to add the link to the queue again
       if (items.length === 0 && fullUrl.includes('/context/pus/lga')) {
+        await this.login(page, true);
+
         await this.pdfLinkQueue.add(
           'CrawlPdf',
           {
             link,
           },
           {
+            lifo: true,
             removeOnComplete: true,
-            removeOnFail: true,
             attempts: 2,
           },
         );
@@ -422,7 +405,7 @@ export class PuppeteerService {
         link['href'],
         redisWardKey,
       );
-      console.log('oldLink', oldLink);
+      this.logger.debug(`oldLink' ==> ${JSON.stringify(oldLink)}`);
       if (!_.isEmpty(oldLink)) {
         const totalButonsItems = items.length;
         const newIndexInc = oldLink.index + 1;
@@ -443,14 +426,9 @@ export class PuppeteerService {
             const pdfLink = this.handlePageScrapingForPdfLink(html, '.pdf');
             this.logger.log(`The pdf links are ${pdfLink}`);
             // send link to kafka
-            await Promise.all([
-              page.goBack(),
-              page.waitForNavigation({
-                waitUntil: 'networkidle0',
-                timeout: 10000,
-              }),
-              this.waitTillHTMLRendered(page),
-            ]);
+            const oldPunPdf = oldLink.puPdf ? oldLink.puPdf : [];
+            const newEntryPuPdf = { index: oldIndex, pdfLink };
+            const newPuPdf = [...oldPunPdf, newEntryPuPdf];
             const newIndex = newIndexInc;
             newUpdatedWarkLink = {
               ...oldLink,
@@ -458,13 +436,35 @@ export class PuppeteerService {
               index: newIndex,
               done: newIndex === totalButonsItems,
               range: [...Array(items.length).keys()],
+              puPdf: newPuPdf,
             };
+            this.pdfKafkaClient.emit(
+              'create_pu_data',
+              JSON.stringify(newUpdatedWarkLink),
+            );
             await this.findWardLinkFromRedisAndUpdate(
               link['href'],
               redisWardKey,
               newUpdatedWarkLink,
             );
-            console.log('newUpdatedWarkLink', newUpdatedWarkLink);
+            this.logger.debug(
+              `newUpdatedWarkLink' ==> ${JSON.stringify(newUpdatedWarkLink)}`,
+            );
+            if (newIndex === totalButonsItems) {
+              const singleRedisKey = `puppeteer:path:wardLink:${newUpdatedWarkLink['href']}`;
+              const singleRedisValue = await this.redis.get(singleRedisKey);
+              this.logger.warn(`All polling units done ${link['href']} 1`);
+              if (_.isEmpty(singleRedisValue)) {
+                await this.redis.set(
+                  singleRedisKey,
+                  JSON.stringify(newUpdatedWarkLink),
+                  'EX',
+                  60 * 60 * 24 * 3,
+                );
+                this.logger.warn(`All polling units done ${link['href']} 2`);
+                this.addCronJob(singleRedisKey, this.getPdfLink);
+              }
+            }
             // add the next link to the queue
             await this.pdfLinkQueue.add(
               'CrawlPdf',
@@ -472,55 +472,12 @@ export class PuppeteerService {
                 link: newUpdatedWarkLink,
               },
               {
+                lifo: true,
                 removeOnComplete: true,
-                removeOnFail: true,
                 attempts: 2,
               },
             );
           }
-          // else {
-          //   newUpdatedWarkLink = {
-          //     ...oldLink,
-          //     puCount: items.length,
-          //     index: newIndexInc,
-          //     range: [...Array(items.length).keys()],
-          //     done: true,
-          //   };
-          // }
-
-          // remove ward link from redis
-          // when all polling unit link is removed from redis then create a new redis sub key ( cycleCount )
-          // For the next run, if(cycleCount !== 0) then get all the ward link with their
-          // polling unit count from redis, if this values equal the fetched ward link and pu count
-          // then skip that ward link and continue to the next ward link
-          //  get all completed cycle ward link from redis and only watch that are completed by recalling this method
-          // const wardLinks = JSON.parse(await this.redis.get(redisWardKey));
-          // const findOneLinkFromRedis = _.find(wardLinks, {
-          //   href: link['href'],
-          // });
-          // if (!_.isEmpty(wardLinks) && findOneLinkFromRedis) {
-          //   const updateWardLinks = wardLinks.filter(
-          //     (e) => e.href !== findOneLinkFromRedis['href'],
-          //   );
-          //   await this.redis.del(redisWardKey);
-          //   await this.redis.set(redisWardKey, JSON.stringify(updateWardLinks));
-          //   if (updateWardLinks.length === 0) {
-          //     await this.redis.del(redisWardKey);
-          //     const cycleCount = 'cycleCount';
-          //     const counts = JSON.parse(await this.redis.get(cycleCount));
-          //     if (counts) {
-          //       const updatedCount = counts + 1;
-          //       await this.redis.del(cycleCount);
-          //       await this.redis.set(
-          //         cycleCount,
-          //         JSON.stringify({ count: updatedCount }),
-          //       );
-          //     } else {
-          //       await this.redis.del(cycleCount);
-          //       await this.redis.set('cycleCount', JSON.stringify(1));
-          //     }
-          //   }
-          // }
         }
       }
     } catch (e) {
@@ -548,12 +505,40 @@ export class PuppeteerService {
     return CheerioPage.createNewInstance(html, guardType).crawlPagePdLinks();
   }
 
+  private async lockLogin(
+    page: Page,
+    refreshToken = false,
+    callback: (
+      page: Page,
+      refreshToken: boolean,
+    ) => Promise<Page> = this.login.bind(this),
+  ): Promise<Page> {
+    let isLocked = false;
+    try {
+      isLocked = await this.idemRedisService.lockProcess(
+        'loginLock',
+        'loginLock',
+      );
+    } catch (e) {
+      this.logger.error(`Failed to lock login process`);
+    }
+    if (!isLocked) {
+      this.logger.warn(
+        `A login process already obtained the lock and has already be called...`,
+      );
+    }
+
+    await callback(page, refreshToken);
+    // await this.idemRedisService.unlockProcess('loginLock');
+    return page;
+  }
+
   /**
    *
    * @param page
    * @private
    */
-  private async login(page: Page): Promise<Page> {
+  private async login(page: Page, refreshToken = false): Promise<Page> {
     try {
       const redisKey = 'puppeteer:login';
       const redisValue = await this.redis.get(redisKey);
@@ -562,49 +547,99 @@ export class PuppeteerService {
         timeout: 10000,
       }); // wait until page load
       await this.waitTillHTMLRendered(page);
-      if (!redisValue) {
-        await page.type("input[name='email']", this.EMAIL);
-        await page.type("input[name='password']", this.PASSWORD);
-        await Promise.all([
-          page.click("button[type='submit']"),
-          page.waitForNavigation({ waitUntil: 'load', timeout: 10000 }),
-          this.waitTillHTMLRendered(page),
-        ]);
-        const localStorageData = await page.evaluate(() => {
-          const json = {};
-          for (let i = 0; i < localStorage.length; i++) {
-            const key = localStorage.key(i);
-            json[key] = localStorage.getItem(key);
+      if (refreshToken || !redisValue) {
+        let isLocked = false;
+        try {
+          isLocked = await this.idemRedisService.lockProcess(
+            'innerLoginLock',
+            'innerLoginLock',
+            60000,
+          );
+        } catch (e) {
+          this.logger.error(`Failed to lock login process`);
+        }
+        if (!isLocked) {
+          this.logger.warn(
+            `A login process already obtained the lock and has already be called...`,
+          );
+          const redisValue = await this.redis.get(redisKey);
+          if (redisValue) {
+            const localStorageData = JSON.parse(redisValue);
+            await page.evaluate((values) => {
+              for (const key in values) {
+                let value = values[key];
+                if (typeof value === 'object') {
+                  value = JSON.stringify(value);
+                }
+                localStorage.setItem(key, value);
+              }
+            }, localStorageData);
+            await page.goto(this.BASE_URL + '/elections/types', {
+              waitUntil: 'networkidle0',
+              timeout: 10000,
+            }); // wait until page load
+            await this.waitTillHTMLRendered(page);
           }
-          return json;
-        });
-        //  From observation, it takes aproximately 300 seconds for the token generated from inecResult site to expire
-        await this.redis.set(
-          redisKey,
-          JSON.stringify(localStorageData),
-          'EX',
-          300,
-        );
+        } else {
+          await page.type("input[name='email']", this.EMAIL);
+          await page.type("input[name='password']", this.PASSWORD);
+          await Promise.all([
+            page.click("button[type='submit']"),
+            page.waitForNavigation({ waitUntil: 'load', timeout: 10000 }),
+            this.waitTillHTMLRendered(page),
+          ]);
+          const localStorageData = await page.evaluate(() => {
+            const json = {};
+            for (let i = 0; i < localStorage.length; i++) {
+              const key = localStorage.key(i);
+              json[key] = localStorage.getItem(key);
+            }
+            return json;
+          });
+          //  From observation, it takes aproximately 300 seconds for the token generated from inecResult site to expire
+          await this.redis.set(
+            redisKey,
+            JSON.stringify(localStorageData),
+            'EX',
+            100,
+          );
+        }
         this.logger.log(
           `Logging in for the first time and creating a new sub key in redis`,
         );
       } else {
-        const localStorageData = JSON.parse(redisValue);
-        await page.evaluate((values) => {
-          for (const key in values) {
-            let value = values[key];
-            if (typeof value === 'object') {
-              value = JSON.stringify(value);
+        let isLocked = false;
+        try {
+          isLocked = await this.idemRedisService.lockProcess(
+            'outerLoginLock',
+            'outerLoginLock',
+            70000,
+          );
+        } catch (e) {
+          this.logger.error(`Failed to lock login process`);
+        }
+        if (!isLocked) {
+          this.logger.warn(
+            `A login process already obtained the lock and has already be called...`,
+          );
+        } else {
+          const localStorageData = JSON.parse(redisValue);
+          await page.evaluate((values) => {
+            for (const key in values) {
+              let value = values[key];
+              if (typeof value === 'object') {
+                value = JSON.stringify(value);
+              }
+              localStorage.setItem(key, value);
             }
-            localStorage.setItem(key, value);
-          }
-        }, localStorageData);
-        await page.goto(this.BASE_URL + '/elections/types', {
-          waitUntil: 'networkidle0',
-          timeout: 10000,
-        }); // wait until page load
-        await this.waitTillHTMLRendered(page);
-        this.logger.log(`Logging in from redis`);
+          }, localStorageData);
+          await page.goto(this.BASE_URL + '/elections/types', {
+            waitUntil: 'networkidle0',
+            timeout: 10000,
+          }); // wait until page load
+          await this.waitTillHTMLRendered(page);
+          this.logger.log(`Logging in from redis`);
+        }
       }
       this.logger.log('PuppeteerService login success');
       return page;
@@ -613,7 +648,15 @@ export class PuppeteerService {
         `before timeout error was thrown PuppeteerService login error
         ${await page.url()}`,
       );
+      page.on('requestfailed', (request) => {
+        this.logger.error(
+          `url: ${request.url()}, errText: ${
+            request.failure().errorText
+          }, method: ${request.method()}`,
+        );
+      });
       await page.screenshot({ path: 'example.png' });
+
       this.logger.error('PuppeteerService login error', e);
     }
   }
@@ -716,5 +759,35 @@ export class PuppeteerService {
         return response;
       }
     }
+  }
+
+  /**
+   *
+   * @param name The name of the job is formed from redis key
+   * @param handler The function that will be executed inside the job
+   */
+  private addCronJob(
+    name: string,
+    handler: (link: Record<string, string>) => Promise<void>,
+  ) {
+    const expression = CronExpression.EVERY_5_MINUTES;
+    const bindHandler = handler.bind(this);
+    const job = new CronJob(`${expression}`, async () => {
+      this.logger.warn(`Cron  ( ${name} ) schedule  to run every 5 minutes`);
+      const redisKey = `${name}`;
+      const redisValue = await this.redis.get(redisKey);
+      if (!_.isEmpty(redisValue)) {
+        console.log('redisValue from the innerCron expresssion', redisValue);
+        const parsedValue = JSON.parse(redisValue);
+        await bindHandler(parsedValue);
+      }
+    });
+
+    this.schedulerRegistry.addCronJob(name, job);
+    job.start();
+
+    this.logger.warn(
+      `job ${name} added for every 5 minutes with cron expression ${expression}`,
+    );
   }
 }

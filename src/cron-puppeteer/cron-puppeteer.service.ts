@@ -1,12 +1,16 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Cron, CronExpression, Timeout } from '@nestjs/schedule';
 import { PuppeteerService } from '../puppeteer/puppeteer.service';
 import { ConfigService } from '@nestjs/config';
 
 @Injectable()
-export class CronPuppeteerService {
+export class CronPuppeteerService implements OnModuleInit {
   private readonly logger = new Logger(CronPuppeteerService.name);
   constructor(private readonly puppeteerService: PuppeteerService) {}
+
+  async onModuleInit() {
+    await this.puppeteerService.onApplicationBootstrap();
+  }
 
   @Timeout(15000) // this would run every 5 minutes
   async runPuppeteerEvery3Minute() {
@@ -23,11 +27,5 @@ export class CronPuppeteerService {
       `Cron ran in ${time2.getTime() - time.getTime()} seconds`,
     );
     this.logger.debug('Every 10 seconds from runEvery10Seconds');
-  }
-
-  @Cron(CronExpression.EVERY_5_SECONDS)
-  handleRefreshWardLinkCron() {
-    this.logger.debug('Called when the current second is 3');
-    this.puppeteerService.refreshDoneWardLinks();
   }
 }

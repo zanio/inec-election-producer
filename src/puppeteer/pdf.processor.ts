@@ -45,26 +45,26 @@ export class PdfPuppeteerProcessor {
     );
   }
 
-  @Process('CrawlPdf')
+  @Process({ name: 'CrawlPdf', concurrency: 1 })
   async handleCrawlPdf(job: Job<IJobWardCrawler>) {
-    let isLocked = false;
-    try {
-      isLocked = await this.idemRedisService.lockProcess(
-        'wardCrawler',
-        'wardCrawler',
-      );
-    } catch (e) {
-      this.logger.error(`Failed to lockProcess`);
-      throw e;
-    }
-    if (!isLocked) {
-      this.logger.error(`A job already obtained the lock...`);
-      throw Error(`A job already obtained the lock`);
-    }
+    // let isLocked = false;
+    // try {
+    //   isLocked = await this.idemRedisService.lockProcess(
+    //     'wardCrawler',
+    //     'wardCrawler',
+    //   );
+    // } catch (e) {
+    //   this.logger.error(`Failed to lockProcess`);
+    //   throw e;
+    // }
+    // if (!isLocked) {
+    //   this.logger.error(`A job already obtained the lock...`);
+    //   throw Error(`A job already obtained the lock`);
+    // }
     this.logger.log('PuppeteerProcessor.handleCrawlPdf starting...');
     const { link } = job.data;
     await this.puppeteerService.getPdfLink(link);
     this.logger.log('PuppeteerProcessor.handleCrawlPdf done...');
-    await this.idemRedisService.unlockProcess('wardCrawler');
+    // await this.idemRedisService.unlockProcess('wardCrawler');
   }
 }

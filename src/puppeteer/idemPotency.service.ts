@@ -22,10 +22,17 @@ export class IdemRedisService {
     );
   }
 
-  async lockProcess(key: string, value: string): Promise<boolean> {
+  async lockProcess(
+    key: string,
+    value: string,
+    timeout = 3000,
+  ): Promise<boolean> {
     const redisValue = await this.redis.get(key);
     if (_.isEmpty(redisValue)) {
-      const response = await this.redis.multi().set(key, value).exec();
+      const response = await this.redis
+        .multi()
+        .set(key, value, 'EX', timeout)
+        .exec();
       console.log(response, 'response');
       const [items] = response;
       if (items.length < 2) {

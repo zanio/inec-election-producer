@@ -41,7 +41,7 @@ export class WardPuppeteerProcessor {
     );
   }
 
-  @Process('wardLinkProcessor')
+  @Process({ name: 'wardLinkProcessor', concurrency: 1 })
   async handleProcessWardLink(job: Job<IJobWardCrawler>) {
     this.logger.log('PuppeteerProcessor.handleProcessWardLink starting...');
     const { link } = job.data;

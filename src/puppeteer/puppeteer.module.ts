@@ -6,6 +6,7 @@ import { PuppeteerProcessor } from './puppeteer.processor';
 import { PdfPuppeteerProcessor } from './pdf.processor';
 import { IdemRedisService } from './idemPotency.service';
 import { WardPuppeteerProcessor } from './ward.processor';
+import { ClientsModule, Transport } from '@nestjs/microservices';
 
 @Module({
   imports: [
@@ -18,6 +19,22 @@ import { WardPuppeteerProcessor } from './ward.processor';
     BullModule.registerQueue({
       name: 'WARD_QUEUE',
     }),
+    ClientsModule.register([
+      {
+        name: 'PDF_INEC_MICROSERVICE',
+        transport: Transport.KAFKA,
+        options: {
+          client: {
+            clientId: 'pdf-inec-microservice',
+            brokers: ['localhost:29092'],
+          },
+          // producerOnlyMode: true,
+          consumer: {
+            groupId: 'pdf-inec-consumer',
+          },
+        },
+      },
+    ]),
   ],
   providers: [
     PuppeteerService,
