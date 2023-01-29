@@ -41,7 +41,7 @@ export class PuppeteerProcessor {
     );
   }
 
-  @Process('wardCrawler')
+  @Process({ name: 'wardCrawler', concurrency: 1 })
   async handleWardCrawler(job: Job<IJobWardCrawler>) {
     this.logger.log('PuppeteerProcessor.handleWardCrawler starting...');
 

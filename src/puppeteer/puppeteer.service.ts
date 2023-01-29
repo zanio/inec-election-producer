@@ -25,6 +25,8 @@ export class PuppeteerService {
 
   STATE_ELECTION_LINK_NAME: string;
 
+  STATE_TO_LGA_LINK_NAME: string;
+
   browserPromise: Promise<Browser>;
 
   redis: Redis.Redis;
@@ -69,6 +71,7 @@ export class PuppeteerService {
     this.STATE_ELECTION_LINK_NAME = this.configService.get<string>(
       'STATE_ELECTION_LINK_NAME',
     );
+    this.STATE_TO_LGA_LINK_NAME = `osun:lgaTotal`;
     this.browserPromise = launch(this.puppeteerOption);
     this.redis = this.redisService.getClient(
       this.configService.get('REDIS_NAME'),
@@ -133,6 +136,10 @@ export class PuppeteerService {
       `The lga available on ${this.STATE_ELECTION_LINK_NAME} ${JSON.stringify(
         lgaLinks,
       )} and size ${lgaLinks.length}`,
+    );
+    await this.redis.set(
+      `${this.STATE_TO_LGA_LINK_NAME}`,
+      JSON.stringify(lgaLinks),
     );
     await this.bulkAddOfLgaToQueue(lgaLinks);
   }
@@ -237,11 +244,23 @@ export class PuppeteerService {
         .del(redisWardKey)
         .set(redisWardKey, JSON.stringify(modifyTotalSchema))
         .exec();
-      this.logger.log(`A total of  ${total.length} ward links added to redis`);
+      this.logger.log(
+        `A total of  ${modifyTotalSchema.length} ward links added to redis`,
+      );
     } catch (e) {
       this.logger.error('PuppeteerService processLgaLink error', e);
+      await this.lgaQueue.add(
+        'wardCrawler',
+        {
+          link,
+        },
+        {
+          removeOnFail: true,
+          attempts: 2,
+        },
+      );
     } finally {
-      // await page.close();
+      await page.close();
       // await browser.close();
       this.logger.log('PuppeteerService processWardAndGetPdfLink page closed');
     }
@@ -250,17 +269,31 @@ export class PuppeteerService {
   async onLgaProcessJobsCompleted() {
     const redisKey = 'puppeteer:path:wardLinks:total';
     const redisValue = await this.redis.get(redisKey);
-    const wardLinks = JSON.parse(redisValue);
-    const completedJobCount = await this.lgaQueue.getCompletedCount();
-    const redisLgaKey = 'puppeteer:path:wardLinks';
-    const allLgaWard = JSON.parse(await this.redis.get(redisLgaKey));
+    const stateLgaRedisKey = this.STATE_TO_LGA_LINK_NAME;
+    const stateLgaRedisValue = await this.redis.get(stateLgaRedisKey);
+    const allLgaAccRedisKey = 'puppeteer:path:wardLinks';
+    const allLgaAccRedisValue = await this.redis.get(allLgaAccRedisKey);
 
-    const LgaKeys = allLgaWard.map((it) => it['path']);
-    // console.log(completedJobCount, LgaKeys, allLgaWard);
-    // this would only run the first time
-    if (completedJobCount === LgaKeys.length) {
-      this.logger.debug(`LgaQueue Done, Begining wardLinkQueue job`);
+    if (
+      _.isEmpty(redisValue) ||
+      _.isEmpty(stateLgaRedisValue) ||
+      _.isEmpty(allLgaAccRedisValue)
+    ) {
+      return;
+    }
+    const wardLinks = JSON.parse(redisValue);
+    const allLga = JSON.parse(stateLgaRedisValue);
+    const allLgaAcc = JSON.parse(allLgaAccRedisValue);
+
+    this.logger.log(
+      `allLgaAcc --> ${allLgaAcc.length} and allLga --> ${allLga.length}`,
+    );
+    if (allLgaAcc.length === allLga.length) {
+      this.logger.debug(
+        `LgaQueue Done, ${this.STATE_ELECTION_LINK_NAME} Begining wardLinkQueue job ${wardLinks.length}}`,
+      );
       await this.distributeLoadForWard(wardLinks);
+      await this.lgaQueue.obliterate({ force: false });
     }
   }
 
@@ -283,7 +316,6 @@ export class PuppeteerService {
       );
     }
   }
-
 
   public async processWardLink(link: Record<string, string>) {
     const browser = await this.browserPromise;
