@@ -94,7 +94,7 @@ export class PuppeteerService {
     if (!_.isEmpty(redisValue)) {
       const wardLinks = JSON.parse(redisValue) as Record<string, string>[];
       const hrefs = wardLinks
-        .filter((e) => e['puCount'] == e['index'])
+        .filter((e) => e['puCount'] === e['index'])
         .map((link) => `puppeteer:path:wardLink:${link['href']}`);
       const uniqHrefs = _.uniq(hrefs);
       for (const link of uniqHrefs) {
@@ -259,7 +259,7 @@ export class PuppeteerService {
     // console.log(completedJobCount, LgaKeys, allLgaWard);
     // this would only run the first time
     if (completedJobCount === LgaKeys.length) {
-      this.logger.log(`Begin wardLinkQueue job`);
+      this.logger.debug(`LgaQueue Done, Begining wardLinkQueue job`);
       await this.distributeLoadForWard(wardLinks);
     }
   }
@@ -283,6 +283,7 @@ export class PuppeteerService {
       );
     }
   }
+
 
   public async processWardLink(link: Record<string, string>) {
     const browser = await this.browserPromise;
@@ -439,7 +440,7 @@ export class PuppeteerService {
               puPdf: newPuPdf,
             };
             this.pdfKafkaClient.emit(
-              'create_pu_data',
+              `create_ward_data_${this.formatWardLinkToId(link['href'])}`,
               JSON.stringify(newUpdatedWarkLink),
             );
             await this.findWardLinkFromRedisAndUpdate(
@@ -461,7 +462,6 @@ export class PuppeteerService {
                   'EX',
                   60 * 60 * 24 * 3,
                 );
-                this.logger.warn(`All polling units done ${link['href']} 2`);
                 this.addCronJob(singleRedisKey, this.getPdfLink);
               }
             }
@@ -770,10 +770,22 @@ export class PuppeteerService {
     name: string,
     handler: (link: Record<string, string>) => Promise<void>,
   ) {
-    const expression = CronExpression.EVERY_5_MINUTES;
+    const range_arr = _.range(4, 30, 2);
+
+    const randomExpressionNumber = Math.floor(Math.random() * range_arr.length);
+    const expression = `0 */${range_arr[randomExpressionNumber] || 10} * * * *`;
     const bindHandler = handler.bind(this);
     const job = new CronJob(`${expression}`, async () => {
-      this.logger.warn(`Cron  ( ${name} ) schedule  to run every 5 minutes`);
+      const allJobs = this.schedulerRegistry.getCronJobs();
+      const jobsKey = Array.from(allJobs.keys()).filter((it) => it !== name);
+      if (job.running) {
+        jobsKey.forEach((el) => {
+          allJobs.get(el).stop();
+        });
+      }
+      this.logger.warn(
+        `Cron  ( ${name} ) schedule  to run every ${range_arr[randomExpressionNumber]} minutes`,
+      );
       const redisKey = `${name}`;
       const redisValue = await this.redis.get(redisKey);
       if (!_.isEmpty(redisValue)) {
@@ -781,13 +793,25 @@ export class PuppeteerService {
         const parsedValue = JSON.parse(redisValue);
         await bindHandler(parsedValue);
       }
+      jobsKey.forEach((el) => {
+        allJobs.get(el).start();
+      });
     });
 
-    this.schedulerRegistry.addCronJob(name, job);
-    job.start();
+    try {
+      this.schedulerRegistry.addCronJob(name, job);
+      job.start();
+    } catch (e) {
+      this.logger.error(e);
+    }
 
     this.logger.warn(
-      `job ${name} added for every 5 minutes with cron expression ${expression}`,
+      `job ${name} added for every ${range_arr[randomExpressionNumber]} minutes with cron expression ${expression}`,
     );
+  }
+
+  private formatWardLinkToId(link: string): string {
+    const linkArray = link.split('/');
+    return linkArray[linkArray.length - 1];
   }
 }
