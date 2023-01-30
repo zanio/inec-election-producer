@@ -50,8 +50,8 @@ export class PdfPuppeteerProcessor {
     // let isLocked = false;
     // try {
     //   isLocked = await this.idemRedisService.lockProcess(
-    //     'wardCrawler',
-    //     'wardCrawler',
+    //     'pdfwardCrawler',
+    //     'pdfwardCrawler',
     //   );
     // } catch (e) {
     //   this.logger.error(`Failed to lockProcess`);
@@ -59,7 +59,6 @@ export class PdfPuppeteerProcessor {
     // }
     // if (!isLocked) {
     //   this.logger.error(`A job already obtained the lock...`);
-    //   throw Error(`A job already obtained the lock`);
     // }
     this.logger.log('PuppeteerProcessor.handleCrawlPdf starting...');
     const { link } = job.data;
